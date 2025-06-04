@@ -21,33 +21,44 @@ WAIT_TIMEOUT = 20  # seconds to wait for elements to appear
 
 # --- CSS Selectors (These might change if GitHub updates its UI) ---
 TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH = "//h2[contains(text(), 'Personal access tokens (classic)')]"
-# UPDATEDSELECTOR: Targets Box-row divs that have a descendant `a > strong`.
-# This change is to adapt to potential GitHub UI updates.
 #
-# --- Debugging Selectors ---
-# If `scrape_tokens` times out waiting for `TOKEN_ROWS_SELECTOR`:
-# 1. This selector was recently updated (see previous git history) due to failures with the old one.
-# 2. Check `output/page_source_at_timeout.html` (saved when TimeoutException occurs).
-#    This file contains the full HTML of the page when the timeout happened.
-# 3. Use browser developer tools (Ctrl+Shift+I or Cmd+Option+I) to:
-#    a. Inspect the elements on the live GitHub tokens page.
-#    b. Right-click the element and choose "Copy > Copy selector" or manually craft one.
-#    c. Test your new selector in the browser's console: `document.querySelectorAll('YOUR_SELECTOR_HERE')`
-#       This should return a list of matching elements.
+# --- IMPORTANT: Debugging CSS Selectors (June 2024 Update) ---
+# The CSS selectors below were updated based on analysis of a new GitHub tokens page HTML structure
+# provided by the user (June 2024). GitHub's UI can change, so these selectors might break.
 #
-# If rows ARE found by `TOKEN_ROWS_SELECTOR` but parsing within the loop fails (e.g., "N/A (Not Found)" for name/expiry):
-# 1. Examine the "Row X HTML snippet" logged for each processed row.
-# 2. This snippet can help verify if `TOKEN_NAME_SELECTOR`, `TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME`,
-#    or `EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK` are still valid within the row's structure.
+# Current Key Selectors:
+#   - TOKEN_ROWS_SELECTOR = 'div.access-token[id^="access-token-"]' (for each token's main container)
+#   - TOKEN_NAME_SELECTOR = 'span.token-description > strong > a' (for the token's name/note)
+#   - NEW_TOKEN_EXPIRATION_TEXT_SELECTOR = 'div span.color-fg-attention > a.color-fg-attention' (for expiration text like "Expired on ...")
+#   - Fallback for expiration: The code also checks for a <relative-time> tag if the above selector fails.
+#
+# If `scrape_tokens` times out waiting for `TOKEN_ROWS_SELECTOR` (no token rows found):
+# 1. This means `TOKEN_ROWS_SELECTOR` is likely outdated.
+# 2. The script *should* save the page HTML to `output/page_source_at_timeout.html`.
+#    Inspect this file to understand the current HTML structure for token rows.
+# 3. Use browser developer tools (Ctrl+Shift+I or Cmd+Option+I) on the live GitHub tokens page:
+#    a. Inspect an individual token row element.
+#    b. Right-click the element and choose "Copy > Copy selector" or manually craft a new, unique CSS selector
+#       for `TOKEN_ROWS_SELECTOR`.
+#    c. Test your new selector in the browser's console: `document.querySelectorAll('YOUR_SELECTOR_HERE')`.
+#       It should return a list of all token row elements.
+#
+# If token rows ARE found, but parsing fails for name or expiration (e.g., "N/A (Not Found)"):
+# 1. Examine the "Row X HTML snippet" logged for each processed row. This shows the HTML the script sees.
+# 2. This snippet will help you verify if `TOKEN_NAME_SELECTOR` or `NEW_TOKEN_EXPIRATION_TEXT_SELECTOR`
+#    (and the <relative-time> fallback) are still valid within the row's structure.
 # 3. Adjust these selectors based on the logged HTML snippet or by inspecting `page_source_at_timeout.html`
-#    or the live page with developer tools.
+#    (if saved) or the live page with developer tools.
+#
+# Remember to update the constant values in this script with any new working selectors.
 # ---
-TOKEN_ROWS_SELECTOR = 'div.Box-row:has(a > strong)'
-TOKEN_NAME_SELECTOR = 'a > strong' # Often the token name (note) is a strong tag within an anchor
-TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME = 'relative-time' # for <relative-time datetime="...">
-EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK = "div.flex-auto.text-right .text-small.text-gray"
-
-
+TOKEN_ROWS_SELECTOR = 'div.access-token[id^="access-token-"]' # Updated June 2024
+TOKEN_NAME_SELECTOR = 'span.token-description > strong > a' # Updated June 2024
+# For tokens that show "Expired on..." or similar text. Updated June 2024.
+NEW_TOKEN_EXPIRATION_TEXT_SELECTOR = 'div span.color-fg-attention > a.color-fg-attention'
+# Old selectors TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME and EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK were removed
+# as the expiration parsing logic has been updated (June 2024) to use NEW_TOKEN_EXPIRATION_TEXT_SELECTOR
+# and a <relative-time> tag fallback.
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
@@ -177,39 +188,55 @@ def scrape_tokens(driver):
 
         # Get expiration date
         try:
-            expiry_relative_time_element = row_element.find_element(By.TAG_NAME, TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME)
-            expiry_datetime_attr = expiry_relative_time_element.get_attribute('datetime')
-            if expiry_datetime_attr:
-                dt_object = datetime.fromisoformat(expiry_datetime_attr.replace('Z', '+00:00'))
-                expiration_date_str = dt_object.strftime('%Y-%m-%d')
-                logging.info(f"Row {i+1}: Found expiration '{expiration_date_str}' using <relative-time> tag with datetime='{expiry_datetime_attr}'.")
+            # Attempt to find the expiration text using the new selector
+            expiration_element = row_element.find_element(By.CSS_SELECTOR, NEW_TOKEN_EXPIRATION_TEXT_SELECTOR)
+            expiration_text = expiration_element.text.strip()
+            logging.info(f"Row {i+1}: Found expiration text element using '{NEW_TOKEN_EXPIRATION_TEXT_SELECTOR}'. Raw text: '{expiration_text}'")
+
+            if "Expired on " in expiration_text:
+                expiration_date_str = expiration_text.split("Expired on ", 1)[1]
+                logging.info(f"Row {i+1}: Parsed 'Expired on' date: '{expiration_date_str}'")
+            elif "No expiration" in expiration_text: # Example, adjust if GitHub uses different phrasing
+                expiration_date_str = "No expiration"
+                logging.info(f"Row {i+1}: Parsed 'No expiration'.")
+            # Add more elif conditions here if GitHub has other formats like "Expires in X days" that need specific parsing.
+            # For now, we capture the raw text if it's not "Expired on " or "No expiration".
             else:
-                expiration_date_str = expiry_relative_time_element.text.strip() if expiry_relative_time_element.text else "Relative-time text (no datetime)"
-                logging.warning(f"Row {i+1}: <relative-time> tag found but 'datetime' attribute missing or empty. Text: '{expiration_date_str}'")
+                # If the text is just a date like "May 22, 2025", or "Expires in X days"
+                # For this iteration, we'll take the text as is if it's not an "Expired on" format.
+                # Future improvements could parse "Expires in X days" to a specific date.
+                expiration_date_str = expiration_text
+                logging.info(f"Row {i+1}: Using raw expiration text as is (not 'Expired on' or 'No expiration' format): '{expiration_date_str}'")
 
         except NoSuchElementException:
-            logging.info(f"Row {i+1}: <relative-time> tag NOT found for expiration. Trying fallback text selector '{EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK}'.")
+            logging.warning(f"Row {i+1}: Expiration text element NOT found using selector '{NEW_TOKEN_EXPIRATION_TEXT_SELECTOR}'. This might mean the token has no expiration displayed in this format, or the selector needs an update.")
+            # Attempt to find a <relative-time> element as a fallback for "no expiration" or specific dates.
             try:
-                expiry_text_container = row_element.find_element(By.CSS_SELECTOR, EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK)
-                expiry_text_content = expiry_text_container.text.strip()
-                logging.info(f"Row {i+1}: Expiry fallback text container content: '{expiry_text_content}'")
-
-                if "No expiration" in expiry_text_content:
-                    expiration_date_str = "No expiration"
-                    logging.info(f"Row {i+1}: Using fallback: 'No expiration' text found.")
-                elif "Expires on" in expiry_text_content: 
-                    expiration_date_str = expiry_text_content 
-                    logging.info(f"Row {i+1}: Using fallback: Expiration text found: '{expiration_date_str}'.")
+                relative_time_element = row_element.find_element(By.TAG_NAME, 'relative-time')
+                datetime_attr = relative_time_element.get_attribute('datetime')
+                if datetime_attr:
+                    dt_object = datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
+                    expiration_date_str = dt_object.strftime('%Y-%m-%d')
+                    logging.info(f"Row {i+1}: Found expiration date '{expiration_date_str}' using <relative-time> tag's datetime attribute.")
                 else:
-                    expiration_date_str = f"Expiry text not recognized ('{expiry_text_content}')"
-                    logging.warning(f"Row {i+1}: Expiry fallback text found but not recognized: '{expiry_text_content}'")
+                    # If <relative-time> exists but has no datetime, check its text.
+                    # It might say "No expiration" or similar.
+                    relative_time_text = relative_time_element.text.strip()
+                    if "no expiration" in relative_time_text.lower(): # Case-insensitive check
+                        expiration_date_str = "No expiration"
+                        logging.info(f"Row {i+1}: Found 'No expiration' in <relative-time> text: '{relative_time_text}'")
+                    else:
+                        expiration_date_str = relative_time_text if relative_time_text else "N/A (relative-time text empty)"
+                        logging.warning(f"Row {i+1}: <relative-time> tag found but 'datetime' attribute missing and text not recognized as 'no expiration'. Text: '{expiration_date_str}'")
             except NoSuchElementException:
-                logging.warning(f"Row {i+1}: Expiration fallback text container NOT found using selector '{EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK}'.")
-            except Exception as e_fallback:
-                logging.error(f"Row {i+1}: Error parsing expiration with fallback for token '{token_name}': {e_fallback}", exc_info=True)
-                expiration_date_str = "Error in fallback (see logs)"
+                logging.warning(f"Row {i+1}: Neither '{NEW_TOKEN_EXPIRATION_TEXT_SELECTOR}' nor <relative-time> tag found. Setting expiration to 'N/A (Not Found)'.")
+                expiration_date_str = "N/A (Not Found)"
+            except Exception as e_rel_time:
+                logging.error(f"Row {i+1}: Error processing <relative-time> fallback for token '{token_name}': {e_rel_time}", exc_info=True)
+                expiration_date_str = "Error parsing relative-time (see logs)"
+
         except Exception as e_expiry:
-            logging.error(f"Row {i+1}: General error parsing expiration for token '{token_name}': {e_expiry}", exc_info=True)
+            logging.error(f"Row {i+1}: General error parsing expiration for token '{token_name}' using '{NEW_TOKEN_EXPIRATION_TEXT_SELECTOR}': {e_expiry}", exc_info=True)
             expiration_date_str = "Error parsing (see logs)"
 
         if token_name != "N/A (Not Found)" and token_name != "Unnamed Token (parsed empty)":
