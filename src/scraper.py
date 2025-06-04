@@ -18,25 +18,23 @@ LOG_FILE = "logs/scraper.log"
 WAIT_TIMEOUT = 20  # seconds to wait for elements to appear
 
 # --- CSS Selectors (These might change if GitHub updates its UI) ---
-# It's crucial to verify these selectors if the script fails to find elements.
-# This targets the frame/container for classic PATs
 TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH = "//h2[contains(text(), 'Personal access tokens (classic)')]"
-# This selector targets each row representing a classic token.
-# It looks for Box-rows within the specific turbo-frame for classic PATs.
-# If this is too fragile, a broader selector might be needed, with more checks in the code.
 TOKEN_ROWS_SELECTOR = 'turbo-frame#js-settings-tokens-classic-PATs-table div.Box-row'
-# Within each row:
-TOKEN_NAME_SELECTOR = 'a > strong'  # The token name (note) is usually a strong tag within an anchor
-TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME = 'relative-time' # for <relative-time datetime="...">
-TOKEN_EXPIRATION_FALLBACK_TEXT_SELECTOR = 'div > span' # If relative-time is not found, look for text like "No expiration."
+TOKEN_NAME_SELECTOR = 'a > strong'
+TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME = 'relative-time'
+# For fallback, we'll inspect the text content of a broader container
+EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK = "div.flex-auto.text-right .text-small.text-gray"
+
 
 # --- Logging Setup ---
+# For debugging, you might want to change level to logging.DEBUG,
+# but for this iteration, INFO level logs are enhanced.
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Keep as INFO, but added more info-level logs for debugging
     format="%(asctime)s [%(levelname)s] - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler() # Also print to console
+        logging.FileHandler(LOG_FILE, mode='w'), # Overwrite log file each run for clarity
+        logging.StreamHandler()
     ]
 )
 
@@ -44,22 +42,18 @@ def setup_driver():
     """Initializes and returns a Selenium Chrome WebDriver."""
     logging.info("Setting up Chrome WebDriver...")
     try:
-        # Automatically download and manage chromedriver
         service = Service(ChromeDriverManager().install())
-        
-        # Chrome options
         chrome_options = webdriver.ChromeOptions()
-        # chrome_options.add_argument("--headless")  # Run headless (no UI) - REMOVE FOR LOGIN
-        # For GitHub login, it's better to run with UI first so user can intervene if needed.
+        # Important: To allow GitHub login, do NOT run headless initially.
+        # chrome_options.add_argument("--headless") 
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1280x800")
         chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
-
         driver = webdriver.Chrome(service=service, options=chrome_options)
         logging.info("✅ Chrome WebDriver setup complete.")
         return driver
     except Exception as e:
-        logging.error(f"❌ Failed to setup Chrome WebDriver: {e}")
+        logging.error(f"❌ Failed to setup Chrome WebDriver: {e}", exc_info=True)
         logging.error("Ensure Google Chrome is installed. If issues persist with chromedriver download, you might need to install it manually and adjust the script or your system PATH.")
         raise
 
@@ -70,7 +64,11 @@ def check_login_and_navigate(driver):
     time.sleep(3) # Allow some time for potential redirects or JS loading
 
     # Check if we were redirected to a login page
-    if "login" in driver.current_url.lower() or "auth" in driver.current_url.lower():
+    # Looking for "login" or "auth" in URL, or title containing "Sign in"
+    current_url_lower = driver.current_url.lower()
+    page_title_lower = driver.title.lower()
+
+    if "login" in current_url_lower or "auth" in current_url_lower or "sign in" in page_title_lower:
         logging.warning("⚠️ It seems you are not logged into GitHub in this browser session.")
         logging.info("Please log in to GitHub in the opened browser window.")
         logging.info("Once logged in and on the 'Personal access tokens (classic)' page, the script will attempt to continue.")
@@ -79,15 +77,15 @@ def check_login_and_navigate(driver):
             WebDriverWait(driver, 300).until( # Wait up to 5 minutes for user login
                 EC.presence_of_element_located((By.XPATH, TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH))
             )
-            logging.info("✅ Successfully navigated to the tokens page after login.")
-            # Re-fetch the target URL to ensure we are on the final page.
+            logging.info("✅ Successfully detected navigation to the tokens page after potential login.")
+            # It's good practice to re-fetch the target URL to ensure we are on the final page state.
             driver.get(GITHUB_TOKENS_URL)
             WebDriverWait(driver, WAIT_TIMEOUT).until(
                 EC.presence_of_element_located((By.XPATH, TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH))
             )
         except TimeoutException:
-            logging.error("❌ Timed out waiting for login or navigation to the tokens page.")
-            logging.error("Please ensure you are logged in and can manually access the classic tokens page.")
+            logging.error("❌ Timed out waiting for login or navigation to the tokens page.", exc_info=True)
+            logging.error("Please ensure you are logged in and can manually access the classic tokens page: " + GITHUB_TOKENS_URL)
             return False
     
     # Verify we are on the classic tokens page by looking for a specific header
@@ -98,7 +96,7 @@ def check_login_and_navigate(driver):
         logging.info("✅ Successfully on the 'Personal access tokens (classic)' page.")
         return True
     except TimeoutException:
-        logging.error(f"❌ Failed to find the classic tokens page identifier: '{TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH}'.")
+        logging.error(f"❌ Failed to find the classic tokens page identifier: '{TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH}'.", exc_info=True)
         logging.error("Ensure you are logged in and the URL is correct. The page structure might have changed.")
         return False
 
@@ -108,105 +106,134 @@ def scrape_tokens(driver):
     tokens_data = []
 
     try:
-        # Wait for the token rows to be present
-        token_rows = WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, TOKEN_ROWS_SELECTOR))
+        logging.info(f"Attempting to find token rows with CSS selector: '{TOKEN_ROWS_SELECTOR}'")
+        # It's better to wait for visibility or presence of at least one, then get all.
+        # This ensures the container itself is loaded.
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, TOKEN_ROWS_SELECTOR.split(' ')[0])) # Wait for the turbo-frame
         )
+        token_rows = driver.find_elements(By.CSS_SELECTOR, TOKEN_ROWS_SELECTOR) # Get all matching rows
         
         if not token_rows:
-            logging.info("ℹ️ No classic personal access tokens found on the page.")
+            logging.info(f"ℹ️ No token rows found using selector '{TOKEN_ROWS_SELECTOR}'. This might mean no classic tokens exist, or the selector is no longer valid for the current page structure.")
+            # To help debug, let's log a snippet of the page if no rows are found
+            try:
+                page_body_snippet = driver.find_element(By.TAG_NAME, "body").get_attribute('outerHTML')[:1000]
+                logging.info(f"Page body snippet (if no rows found): {page_body_snippet}...")
+            except Exception as e_body_log:
+                logging.warning(f"Could not log page body snippet: {e_body_log}")
             return []
 
-        logging.info(f"Found {len(token_rows)} potential token entries.")
+        logging.info(f"Found {len(token_rows)} potential token entries/rows based on selector '{TOKEN_ROWS_SELECTOR}'.")
 
-        for row in token_rows:
-            token_name = "N/A"
-            expiration_date_str = "N/A"
+        for i, row_element in enumerate(token_rows):
+            logging.info(f"--- Processing potential token row {i+1}/{len(token_rows)} ---")
+            try:
+                # Log the HTML of the row for manual inspection
+                row_html_snippet = row_element.get_attribute('outerHTML')[:700] # Get a snippet
+                logging.info(f"Row {i+1} HTML snippet: {row_html_snippet} ...")
+            except Exception as e_html:
+                logging.warning(f"Could not get HTML for row {i+1}: {e_html}")
+
+            token_name = "N/A (Not Found)"
+            expiration_date_str = "N/A (Not Found)"
 
             # Get token name
             try:
-                name_element = row.find_element(By.CSS_SELECTOR, TOKEN_NAME_SELECTOR)
-                token_name = name_element.text.strip() if name_element.text.strip() else "Unnamed Token"
+                name_element = row_element.find_element(By.CSS_SELECTOR, TOKEN_NAME_SELECTOR)
+                token_name_text = name_element.text.strip()
+                token_name = token_name_text if token_name_text else "Unnamed Token (parsed empty)"
+                logging.info(f"Row {i+1}: Found token name '{token_name}' using selector '{TOKEN_NAME_SELECTOR}'")
             except NoSuchElementException:
-                logging.warning("Could not find token name element for a row. Using 'N/A'. Row HTML: " + row.get_attribute('outerHTML')[:100])
+                logging.warning(f"Row {i+1}: Token name element NOT found using selector '{TOKEN_NAME_SELECTOR}'.")
+                # Log child elements if name not found, to help debug selector path
+                try:
+                    child_elements_details = []
+                    # Get direct children first, then maybe some key descendants
+                    direct_children = row_element.find_elements(By.XPATH, "./*") 
+                    for child_idx, child in enumerate(direct_children[:5]): # Log details of first 5 direct children
+                         child_elements_details.append(f"Direct Child {child_idx}: tag={child.tag_name}, text='{child.text[:30].strip() if child.text else ''}'")
+                    logging.info(f"Row {i+1} Direct Child details for name search (first 5): {'; '.join(child_elements_details)}")
+                except Exception as e_child_debug:
+                    logging.info(f"Row {i+1} Could not get detailed child elements for debugging: {e_child_debug}")
 
 
             # Get expiration date
-            # GitHub uses <relative-time> for dates, which is good.
-            # Fallback if structure changes or for "No expiration".
             try:
-                # First, try to find the <relative-time> element which has a 'datetime' attribute
-                expiry_element_relative_time = row.find_element(By.TAG_NAME, TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME)
-                expiry_datetime_attr = expiry_element_relative_time.get_attribute('datetime')
-                # Convert ISO 8601 datetime to a more readable format, e.g., "YYYY-MM-DD"
-                dt_object = datetime.fromisoformat(expiry_datetime_attr.replace('Z', '+00:00'))
-                expiration_date_str = dt_object.strftime('%Y-%m-%d')
+                expiry_relative_time_element = row_element.find_element(By.TAG_NAME, TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME)
+                expiry_datetime_attr = expiry_relative_time_element.get_attribute('datetime')
+                if expiry_datetime_attr:
+                    dt_object = datetime.fromisoformat(expiry_datetime_attr.replace('Z', '+00:00'))
+                    expiration_date_str = dt_object.strftime('%Y-%m-%d')
+                    logging.info(f"Row {i+1}: Found expiration '{expiration_date_str}' using <relative-time> tag with datetime='{expiry_datetime_attr}'.")
+                else:
+                    # This case should be rare if <relative-time> is present but lacks datetime
+                    expiration_date_str = expiry_relative_time_element.text.strip() if expiry_relative_time_element.text else "Relative-time text (no datetime)"
+                    logging.warning(f"Row {i+1}: <relative-time> tag found but 'datetime' attribute missing or empty. Text: '{expiration_date_str}'")
+
             except NoSuchElementException:
-                # If <relative-time> not found, try to find text like "No expiration" or "Expires on..."
-                # This part might need refinement based on actual HTML for "No expiration"
+                logging.info(f"Row {i+1}: <relative-time> tag NOT found for expiration. Trying fallback text selector '{EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK}'.")
                 try:
-                    # Look for a span or div that might contain "No expiration" or "Expires..."
-                    # This is less precise and might need adjustment based on GitHub's specific HTML.
-                    # Typically, the expiration info is in the second 'flex-auto text-right' div
-                    expiry_text_elements = row.find_elements(By.CSS_SELECTOR, ".flex-auto.text-right .text-small.text-gray span")
-                    found_expiry_text = False
-                    for el in expiry_text_elements:
-                        text_content = el.text.strip()
-                        if "No expiration" in text_content:
-                            expiration_date_str = "No expiration"
-                            found_expiry_text = True
-                            break
-                        elif "Expires on" in text_content: # Fallback if relative-time missing but text exists
-                            expiration_date_str = text_content 
-                            found_expiry_text = True
-                            break
-                    if not found_expiry_text:
-                         expiration_date_str = "Expiration not found" # Default if nothing specific is identified
+                    # Look for the specific container that usually holds "Expires on..." or "No expiration"
+                    expiry_text_container = row_element.find_element(By.CSS_SELECTOR, EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK)
+                    expiry_text_content = expiry_text_container.text.strip()
+                    logging.info(f"Row {i+1}: Expiry fallback text container content: '{expiry_text_content}'")
+
+                    if "No expiration" in expiry_text_content:
+                        expiration_date_str = "No expiration"
+                        logging.info(f"Row {i+1}: Using fallback: 'No expiration' text found.")
+                    elif "Expires on" in expiry_text_content: # Example: "Expires on Jan 1, 2025."
+                        expiration_date_str = expiry_text_content 
+                        logging.info(f"Row {i+1}: Using fallback: Expiration text found: '{expiration_date_str}'.")
+                    # Add more specific checks if GitHub uses other phrases
+                    else:
+                        expiration_date_str = f"Expiry text not recognized ('{expiry_text_content}')"
+                        logging.warning(f"Row {i+1}: Expiry fallback text found but not recognized: '{expiry_text_content}'")
                 except NoSuchElementException:
-                    logging.warning(f"Could not find expiration date element for token '{token_name}'. Row HTML: " + row.get_attribute('outerHTML')[:100])
-                    expiration_date_str = "N/A (parsing error)"
-            except Exception as e:
-                logging.error(f"Error parsing expiration for token '{token_name}': {e}")
-                expiration_date_str = "Error parsing expiry"
+                    logging.warning(f"Row {i+1}: Expiration fallback text container NOT found using selector '{EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK}'.")
+                except Exception as e_fallback:
+                    logging.error(f"Row {i+1}: Error parsing expiration with fallback for token '{token_name}': {e_fallback}", exc_info=True)
+                    expiration_date_str = "Error in fallback (see logs)"
+            except Exception as e_expiry:
+                logging.error(f"Row {i+1}: General error parsing expiration for token '{token_name}': {e_expiry}", exc_info=True)
+                expiration_date_str = "Error parsing (see logs)"
 
-            if token_name != "N/A": # Only add if we got a name
+            # Add to list if a name was reasonably found (not the default "N/A (Not Found)")
+            if token_name != "N/A (Not Found)" and token_name != "Unnamed Token (parsed empty)":
                 tokens_data.append({"Token Name": token_name, "Expiration Date": expiration_date_str})
-                logging.info(f"  ✔️ Scraped: Name='{token_name}', Expiry='{expiration_date_str}'")
+                logging.info(f"Row {i+1}: ✔️ Successfully parsed and added to list: Name='{token_name}', Expiry='{expiration_date_str}'")
             else:
-                logging.warning(f"  ⚠️ Skipped a row due to missing token name.")
-
+                logging.warning(f"Row {i+1}: ⚠️ Skipped adding to list. Token Name was '{token_name}'. This row might not be a valid token or name parsing failed critically.")
+            logging.info(f"--- Finished processing row {i+1} ---")
 
     except TimeoutException:
-        logging.warning(f"⏰ Timed out waiting for token rows using selector: '{TOKEN_ROWS_SELECTOR}'. No tokens scraped or page structure changed.")
+        logging.warning(f"⏰ Timed out waiting for token rows using selector: '{TOKEN_ROWS_SELECTOR}'. No tokens scraped or page structure changed.", exc_info=True)
     except Exception as e:
-        logging.error(f"❌ An error occurred during scraping: {e}")
+        logging.error(f"❌ An unexpected error occurred during the scraping process: {e}", exc_info=True)
 
+    if not tokens_data:
+        logging.warning("No token data was successfully extracted into the list. The output CSV will be empty (except for headers). Review logs for parsing issues.")
     return tokens_data
 
 def save_to_csv(data, filename):
     """Saves the scraped data to a CSV file."""
     if not data:
-        logging.info("No data to save to CSV.")
-        # Create empty CSV with headers if file doesn't exist or is empty
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ["Token Name", "Expiration Date"]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-        logging.info(f"Wrote headers to empty CSV: {filename}")
-        return
-
-    logging.info(f"💾 Saving data to {filename}...")
+        logging.info("No data to save to CSV. Writing headers only.")
+    else:
+        logging.info(f"💾 Saving {len(data)} token(s) to {filename}...")
+    
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ["Token Name", "Expiration Date"]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(data)
-        logging.info(f"✅ Data successfully saved to {filename}.")
+            if data: # Only write rows if data is not empty
+                writer.writerows(data)
+        logging.info(f"✅ Data (or headers) successfully saved to {filename}.")
     except IOError as e:
-        logging.error(f"❌ IOError saving data to CSV: {e}")
+        logging.error(f"❌ IOError saving data to CSV: {e}", exc_info=True)
     except Exception as e:
-        logging.error(f"❌ An unexpected error occurred while saving to CSV: {e}")
+        logging.error(f"❌ An unexpected error occurred while saving to CSV: {e}", exc_info=True)
 
 
 def main():
@@ -219,20 +246,11 @@ def main():
             logging.error("Could not verify login or navigate to the correct page. Exiting.")
             return
 
-        # Optional: Give user a few seconds to see the page or if any manual interaction is needed
-        # logging.info("Pausing for 5 seconds before scraping starts...")
-        # time.sleep(5)
-
         scraped_tokens = scrape_tokens(driver)
-
-        if scraped_tokens:
-            save_to_csv(scraped_tokens, OUTPUT_FILE)
-        else:
-            logging.info("No tokens were scraped. An empty CSV with headers will be created if it doesn't exist.")
-            save_to_csv([], OUTPUT_FILE) # Ensure CSV is created with headers
+        save_to_csv(scraped_tokens, OUTPUT_FILE)
 
     except Exception as e:
-        logging.error(f"🚨 An critical error occurred in the main process: {e}")
+        logging.error(f"🚨 An critical error occurred in the main process: {e}", exc_info=True)
     finally:
         if driver:
             logging.info("Closing WebDriver...")
