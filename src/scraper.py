@@ -21,9 +21,28 @@ WAIT_TIMEOUT = 20  # seconds to wait for elements to appear
 
 # --- CSS Selectors (These might change if GitHub updates its UI) ---
 TOKEN_PAGE_IDENTIFIER_ELEMENT_XPATH = "//h2[contains(text(), 'Personal access tokens (classic)')]"
-# NEW SELECTOR: Targets Box-row divs whose ID starts with "user_token_classic_"
-# This is based on common GitHub patterns for such elements.
-TOKEN_ROWS_SELECTOR = 'div.Box-row[id^="user_token_classic_"]'
+# UPDATEDSELECTOR: Targets Box-row divs that have a descendant `a > strong`.
+# This change is to adapt to potential GitHub UI updates.
+#
+# --- Debugging Selectors ---
+# If `scrape_tokens` times out waiting for `TOKEN_ROWS_SELECTOR`:
+# 1. This selector was recently updated (see previous git history) due to failures with the old one.
+# 2. Check `output/page_source_at_timeout.html` (saved when TimeoutException occurs).
+#    This file contains the full HTML of the page when the timeout happened.
+# 3. Use browser developer tools (Ctrl+Shift+I or Cmd+Option+I) to:
+#    a. Inspect the elements on the live GitHub tokens page.
+#    b. Right-click the element and choose "Copy > Copy selector" or manually craft one.
+#    c. Test your new selector in the browser's console: `document.querySelectorAll('YOUR_SELECTOR_HERE')`
+#       This should return a list of matching elements.
+#
+# If rows ARE found by `TOKEN_ROWS_SELECTOR` but parsing within the loop fails (e.g., "N/A (Not Found)" for name/expiry):
+# 1. Examine the "Row X HTML snippet" logged for each processed row.
+# 2. This snippet can help verify if `TOKEN_NAME_SELECTOR`, `TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME`,
+#    or `EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK` are still valid within the row's structure.
+# 3. Adjust these selectors based on the logged HTML snippet or by inspecting `page_source_at_timeout.html`
+#    or the live page with developer tools.
+# ---
+TOKEN_ROWS_SELECTOR = 'div.Box-row:has(a > strong)'
 TOKEN_NAME_SELECTOR = 'a > strong' # Often the token name (note) is a strong tag within an anchor
 TOKEN_EXPIRATION_SELECTOR_RELATIVE_TIME = 'relative-time' # for <relative-time datetime="...">
 EXPIRY_TEXT_CONTAINER_SELECTOR_FALLBACK = "div.flex-auto.text-right .text-small.text-gray"
